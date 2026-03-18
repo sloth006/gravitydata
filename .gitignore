@@ -1,0 +1,13 @@
+# Safetensors datasets and generated CSV indices
+*.safetensors
+
+# Generated index / status / OOM CSVs
+index.csv
+oom_jobs.csv
+
+# Any CSVs under dataset output directories
+datasets_*/**/*.csv
+mha_fp16/**/*.csv
+mha_bf16/**/*.csv
+gqa_fp16/**/*.csv
+
