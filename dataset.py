@@ -77,11 +77,16 @@ def _attention_forward(
     kv_mask: torch.Tensor,
     scale: float | None = None,
     num_kv_heads: int | None = None,
+    q_phase: Literal["prefill", "causal"] = "prefill",
 ) -> torch.Tensor:
     """
     Scaled dot-product attention via PyTorch SDPA.
     q: (B, H_q, Q_len, head_size), k/v: (B, H_kv, Kv_len, head_size). For GQA, H_kv < H_q.
     If num_kv_heads is set and H_kv != H_q, K/V are repeated to match Q head count (GQA).
+    q_phase:
+        - "prefill": no causal restriction between Q positions and KV positions.
+        - "causal": apply a lower-triangular restriction so Q index `i` can only
+          attend to KV positions `<= i`.
     Returns (B, H_q, Q_len, head_size).
     """
     B, H_q, Q_len, _ = q.shape
@@ -92,11 +97,23 @@ def _attention_forward(
         repeat = H_q // H_kv
         k = k.repeat_interleave(repeat, dim=1)
         v = v.repeat_interleave(repeat, dim=1)
-    attn_mask = torch.where(
-        kv_mask.expand(B, 1, Q_len, Kv_len) > 0.5,
-        0.0,
-        float("-inf"),
-    ).to(q.dtype)
+    allowed = kv_mask.expand(B, 1, Q_len, Kv_len) > 0.5
+    if q_phase == "causal":
+        # 1. Get the actual length of each KV sequence in the batch (ignoring padding)
+        seq_lens = kv_mask.sum(dim=-1, keepdim=True)
+
+        # 2. Convert relative Q positions (0 to Q_len-1) to absolute positions
+        q_pos = torch.arange(Q_len, device=q.device).view(1, 1, Q_len, 1)
+        abs_q_pos = (seq_lens - Q_len) + q_pos
+
+        # 3. Get absolute KV positions
+        kv_pos = torch.arange(Kv_len, device=q.device).view(1, 1, 1, Kv_len)
+
+        # 4. Correct causal condition: KV_pos must be <= absolute Q_pos
+        causal_allow = kv_pos <= abs_q_pos
+        allowed = allowed & causal_allow
+
+    attn_mask = torch.where(allowed, 0.0, float("-inf")).to(q.dtype)
     scale = scale or (q.shape[-1] ** -0.5)
     out = F.scaled_dot_product_attention(
         q, k, v,
@@ -118,6 +135,7 @@ def generate_dataset(
     num_heads: int = 1,
     num_kv_heads: int | None = None,
     attn_type: AttnType = "mha",
+    q_phase: Literal["prefill", "causal"] = "prefill",
     num_batches: int = 1,
     seed: int | None = DEFAULT_SEED,
     device: str | torch.device | None = None,
@@ -151,6 +169,9 @@ def generate_dataset(
         q_length: Query sequence length.
         head_size: Attention head dimension.
         num_batches: Number of batch groups to generate (each can have different kv_len if dist).
+        q_phase: How to mask attention across Q positions:
+            - "prefill": current behavior (no causal Q-Q constraint).
+            - "causal": apply KV_pos <= Q_pos triangular constraint.
         seed: Random seed for reproducibility.
 
     Returns:
@@ -393,7 +414,9 @@ def generate_dataset(
         out["kv_mask"] = mask
 
         # Reference attention output (GQA: K/V expanded to num_heads inside _attention_forward)
-        out["attn_out"] = _attention_forward(q, k, v, mask, num_kv_heads=num_kv_heads)
+        out["attn_out"] = _attention_forward(
+            q, k, v, mask, num_kv_heads=num_kv_heads, q_phase=q_phase
+        )
 
     out["batch_size"] = torch.tensor([batch_size], dtype=torch.int64)
     out["q_length"] = torch.tensor([q_length], dtype=torch.int64)
@@ -459,6 +482,12 @@ def main() -> None:
         help='KV length distribution: "fixed" | "uniform,min,max" | "normal,mean,std" | "poisson,lambda" | "len1:w1,len2:w2" | "min,max"',
     )
     ap.add_argument("--q-length", "-q", type=int, default=128, help="Query sequence length")
+    ap.add_argument(
+        "--q-phase",
+        choices=["prefill", "causal"],
+        default="prefill",
+        help='Attention phase: "prefill" or "causal" (controls Q-V mask).',
+    )
     ap.add_argument("--head-size", type=int, default=64, help="Head dimension")
     ap.add_argument("--num-heads", type=int, default=8, help="Number of query heads (MHA: same as KV; GQA: 8 typical)")
     ap.add_argument("--num-kv-heads", type=int, default=None, help="Number of K/V heads (GQA only; default 1 for gqa, num_heads for mha)")
@@ -488,6 +517,7 @@ def main() -> None:
         seed=args.seed,
         device=args.device,
         deterministic=args.deterministic,
+        q_phase=args.q_phase,
     )
     save_dataset(data, args.output)
     print(f"Saved to {args.output}: {list(data.keys())}")

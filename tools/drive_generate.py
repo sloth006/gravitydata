@@ -231,16 +231,18 @@ def _build_rows(
 
 def _row_to_generate_kwargs(row: dict, device: str | None, seed: int | None, _job_idx: int) -> dict:
     kv_dist = (row["kv_dist_type"], int(row["kv_mean"]))
+    q_len = int(row["q_len"])
     return {
         "batch_size": int(row["batch"]),
         "dtype": row["dtype"],
         "kv_cache": True,
         "kv_cache_size_dist": kv_dist,
-        "q_length": int(row["q_len"]),
+        "q_length": q_len,
         "head_size": int(row["head_dim"]),
         "num_heads": int(row["num_heads"]),
         "num_kv_heads": int(row["num_kv_heads"]),
         "attn_type": row["attn_type"],
+        "q_phase": "prefill" if q_len > 2 else "causal",
         "num_batches": 1,
         "seed": seed if seed is not None else DEFAULT_SEED,
         "device": device,

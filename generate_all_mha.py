@@ -51,6 +51,7 @@ def generate_all_mha(
     dtype_filter: str | None = None,
     start_job: int = 0,
     deterministic: bool = False,
+    force: bool = False,
 ) -> list[dict]:
     """
     Generate all MHA combinations into out_dir. Returns metadata rows.
@@ -119,7 +120,8 @@ def generate_all_mha(
                                 "head_dim": head,
                                 "attn_type": attn_type,
                             }
-                            if path.exists():
+                            q_phase = "prefill" if q_resolved > 2 else "causal"
+                            if path.exists() and not force:
                                 total_bytes += path.stat().st_size
                                 rows.append(row_data)
                                 done_count += 1
@@ -141,6 +143,7 @@ def generate_all_mha(
                                         num_heads=num_heads,
                                         num_kv_heads=num_kv_heads,
                                         attn_type=attn_type,
+                                        q_phase=q_phase,
                                         num_batches=1,
                                         seed=cur_seed,
                                         device=device,
@@ -206,6 +209,7 @@ def main() -> None:
     )
     ap.add_argument("--start", type=int, default=0, metavar="N", help="Skip first N jobs (0-based); e.g. --start 1850 to resume from job 1850")
     ap.add_argument("--deterministic", action="store_true", help="Enable strict deterministic settings")
+    ap.add_argument("--force", action="store_true", help="Regenerate even if output files already exist")
     args = ap.parse_args()
 
     dtype_filter = None if args.dtype == "all" else args.dtype
@@ -216,6 +220,7 @@ def main() -> None:
         dtype_filter=dtype_filter,
         start_job=args.start,
         deterministic=args.deterministic,
+        force=args.force,
     )
     print(f"Generated {len(rows)} MHA files in {args.output_dir}")
     print(f"Total file size: {_fmt_size(total_bytes)}")

@@ -232,6 +232,7 @@ def run_pending(index_csv: str | Path, *, device: str | None = None) -> None:
                 num_heads=int(row["num_heads"]),
                 num_kv_heads=int(row["num_kv_heads"]),
                 attn_type=row["attn_type"],
+                q_phase="prefill" if int(row["q_len"]) > 2 else "causal",
                 num_batches=1,
                 seed=DEFAULT_SEED,
                 device=dev_str,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import io
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
@@ -92,6 +93,35 @@ class DriveUploader:
         while response is None:
             _status, response = request.next_chunk()
         return response["id"]
+
+    def download_file(self, file_id: str, local_path: str | Path) -> Path:
+        """Download a Drive file by ID to a local path. Returns the path."""
+        path = Path(local_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        fh = io.BytesIO()
+        downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
+        done = False
+        while not done:
+            _status, done = downloader.next_chunk()
+        path.write_bytes(fh.getvalue())
+        return path
+
+    def list_files_in_folder(self, folder_id: str | None = None) -> list[dict]:
+        """List files in a Drive folder. Returns list of dicts with 'id' and 'name'."""
+        folder_id = folder_id or self.folder_id
+        result = (
+            self.service.files()
+            .list(
+                q=f"'{folder_id}' in parents",
+                pageSize=1000,
+                fields="files(id,name)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            )
+            .execute()
+        )
+        return result.get("files", [])
 
 
 def _cpu_free_gb() -> float | None:

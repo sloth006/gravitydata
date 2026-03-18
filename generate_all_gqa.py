@@ -75,6 +75,7 @@ def generate_all_gqa(
     split_parts: int = 1,
     split_index: int = 0,
     deterministic: bool = False,
+    force: bool = False,
 ) -> list[dict]:
     """
     Generate all GQA combinations into out_dir, with a separate subfolder per ratio
@@ -124,6 +125,7 @@ def generate_all_gqa(
                         kv_dist = (dist_key, kv_mean)
                         for q_len in Q_LENGTHS:
                             q_resolved = _resolve_q_length(q_len)
+                            q_phase = "prefill" if q_resolved > 2 else "causal"
                             for head in HEAD_SIZES:
                                 attn_type = "gqa"
                                 name = _filename(
@@ -161,7 +163,7 @@ def generate_all_gqa(
                                     "head_dim": head,
                                     "attn_type": attn_type,
                                 }
-                                if path.exists():
+                                if path.exists() and not force:
                                     total_bytes += path.stat().st_size
                                     row = {**row_data}
                                     rows.append(row)
@@ -185,6 +187,7 @@ def generate_all_gqa(
                                             num_heads=num_heads,
                                             num_kv_heads=num_kv_heads,
                                             attn_type=attn_type,
+                                            q_phase=q_phase,
                                             num_batches=1,
                                             seed=cur_seed,
                                             device=device,
@@ -274,6 +277,7 @@ def main() -> None:
         help="Which part to run (0-based index, must be < --split-parts).",
     )
     ap.add_argument("--deterministic", action="store_true", help="Enable strict deterministic settings")
+    ap.add_argument("--force", action="store_true", help="Regenerate even if output files already exist")
     args = ap.parse_args()
 
     dtype_filter = None if args.dtype == "all" else args.dtype
@@ -286,6 +290,7 @@ def main() -> None:
         split_parts=args.split_parts,
         split_index=args.split_index,
         deterministic=args.deterministic,
+        force=args.force,
     )
     print(f"Generated {len(rows)} GQA files under {args.output_dir}")
     print(f"Total file size: {_fmt_size(total_bytes)}")
