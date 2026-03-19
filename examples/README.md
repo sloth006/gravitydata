@@ -46,15 +46,28 @@ python -m examples.get_data_from_cloud \
   --drive-folder-id YOUR_FOLDER_ID \
   --auth oauth \
   --credentials-json /path/to/client_secret.json \
+  --token-json token.json \
   --out-dir ./downloaded
 ```
 
 **By index CSV (download only files listed in the index):**
+
+When using `--index-csv`, this repo expects your CSV to contain a `drive_file_id` column.
+Rows without `drive_file_id` are skipped.
 ```bash
 python -m examples.get_data_from_cloud \
   --index-csv mha_fp16/index.csv \
   --auth oauth \
   --credentials-json /path/to/client_secret.json \
+  --out-dir ./downloaded
+```
+
+**Using a service account (alternative to OAuth interactive flow):**
+```bash
+python -m examples.get_data_from_cloud \
+  --index-csv mha_fp16/index.csv \
+  --auth service-account \
+  --credentials-json /path/to/service_account.json \
   --out-dir ./downloaded
 ```
 
