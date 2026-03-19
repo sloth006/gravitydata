@@ -99,17 +99,19 @@ def _attention_forward(
         v = v.repeat_interleave(repeat, dim=1)
     allowed = kv_mask.expand(B, 1, Q_len, Kv_len) > 0.5
     if q_phase == "causal":
+        # Causal/decode: Q tokens are the *next* tokens after the KV cache (not the last
+        # Q_len of the sequence). So absolute Q position = seq_lens + q_pos.
         # 1. Get the actual length of each KV sequence in the batch (ignoring padding)
         seq_lens = kv_mask.sum(dim=-1, keepdim=True)
 
-        # 2. Convert relative Q positions (0 to Q_len-1) to absolute positions
-        q_pos = torch.arange(Q_len, device=q.device).view(1, 1, Q_len, 1)
+        # 2. Relative Q positions (0 to Q_len-1) -> absolute positions (after cache)
+        q_pos = torch.arange(Q_len, device=q.device, dtype=seq_lens.dtype).view(1, 1, Q_len, 1)
         abs_q_pos = (seq_lens - Q_len) + q_pos
 
-        # 3. Get absolute KV positions
-        kv_pos = torch.arange(Kv_len, device=q.device).view(1, 1, 1, Kv_len)
+        # 3. Absolute KV positions (0 to Kv_len-1)
+        kv_pos = torch.arange(Kv_len, device=q.device, dtype=seq_lens.dtype).view(1, 1, 1, Kv_len)
 
-        # 4. Correct causal condition: KV_pos must be <= absolute Q_pos
+        # 4. Causal: allow KV_pos <= abs_q_pos (Q can attend to past and current)
         causal_allow = kv_pos <= abs_q_pos
         allowed = allowed & causal_allow
 
@@ -135,6 +137,7 @@ def generate_dataset(
     num_heads: int = 1,
     num_kv_heads: int | None = None,
     attn_type: AttnType = "mha",
+    compute_attn_out: bool = True,
     q_phase: Literal["prefill", "causal"] = "prefill",
     num_batches: int = 1,
     seed: int | None = DEFAULT_SEED,
@@ -169,6 +172,8 @@ def generate_dataset(
         q_length: Query sequence length.
         head_size: Attention head dimension.
         num_batches: Number of batch groups to generate (each can have different kv_len if dist).
+        compute_attn_out: If True, compute and return `attn_out`.
+            If False, only generate `q`, `k`, `v`, `kv_lengths`, `kv_mask`, and scalar metadata.
         q_phase: How to mask attention across Q positions:
             - "prefill": current behavior (no causal Q-Q constraint).
             - "causal": apply KV_pos <= Q_pos triangular constraint.
@@ -414,9 +419,10 @@ def generate_dataset(
         out["kv_mask"] = mask
 
         # Reference attention output (GQA: K/V expanded to num_heads inside _attention_forward)
-        out["attn_out"] = _attention_forward(
-            q, k, v, mask, num_kv_heads=num_kv_heads, q_phase=q_phase
-        )
+        if compute_attn_out:
+            out["attn_out"] = _attention_forward(
+                q, k, v, mask, num_kv_heads=num_kv_heads, q_phase=q_phase
+            )
 
     out["batch_size"] = torch.tensor([batch_size], dtype=torch.int64)
     out["q_length"] = torch.tensor([q_length], dtype=torch.int64)

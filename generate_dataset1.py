@@ -98,8 +98,11 @@ def _filename(
     )
 
 
-def _build_job_rows(out_dir: Path) -> list[dict]:
-    """Build full list of job rows (path, params, status=pending)."""
+def _build_job_rows(out_dir: Path, q_lengths_filter: list[int] | None = None) -> list[dict]:
+    """Build full list of job rows (path, params, status=pending).
+    If q_lengths_filter is set, only those q lengths are included (e.g. [5] for q=5 only).
+    """
+    q_lens = q_lengths_filter if q_lengths_filter is not None else Q_LENGTHS
     rows: list[dict] = []
     for num_heads, num_kv_heads in GQA_TYPES:
         ratio_dir = out_dir / f"gqa_{num_heads}_{num_kv_heads}" / "bf16"
@@ -109,7 +112,7 @@ def _build_job_rows(out_dir: Path) -> list[dict]:
                 dists = KV_DISTRIBUTIONS if kv_mean > 1 else [KV_DISTRIBUTIONS[0]]
                 for kv_dist_type, dist_key in dists:
                     kv_dist = (dist_key, kv_mean)
-                    for q_len in Q_LENGTHS:
+                    for q_len in q_lens:
                         name = _filename(
                             DTYPE,
                             kv_dist_type,
@@ -201,6 +204,7 @@ def run(
     retry_oom_once: bool = True,
     force: bool = False,
     regenerate_q_lengths: list[int] | None = None,
+    q_lengths_filter: list[int] | None = None,
 ) -> None:
     out_path = Path(out_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
@@ -208,7 +212,7 @@ def run(
     oom_path = out_path / OOM_FILENAME
 
     # Build full job list and merge with existing index so we preserve status
-    fresh_rows = _build_job_rows(out_path)
+    fresh_rows = _build_job_rows(out_path, q_lengths_filter=q_lengths_filter)
     rows = _merge_with_existing_index(fresh_rows, index_path)
     total = len(rows)
     def is_pending(row: dict) -> bool:
@@ -366,7 +370,7 @@ def run(
                             num_heads=int(row["num_heads"]),
                             num_kv_heads=int(row["num_kv_heads"]),
                             attn_type=row["attn_type"],
-                            q_phase="prefill" if int(row["q_len"]) > 2 else "causal",
+                            q_phase="causal" if int(row["q_len"]) > 2 else "prefill",
                             num_batches=1,
                             seed=seed,
                             device=device,
@@ -448,6 +452,11 @@ def main() -> None:
         default="all",
         help='Comma list of q lengths to regenerate (e.g. "5" or "1,5"). Default "all".',
     )
+    ap.add_argument(
+        "--q5-only",
+        action="store_true",
+        help="Only generate jobs with q_length=5 (skips q_length=1).",
+    )
     args = ap.parse_args()
 
     q_lengths: list[int] | None
@@ -455,6 +464,8 @@ def main() -> None:
         q_lengths = None
     else:
         q_lengths = [int(x.strip()) for x in args.regenerate_q_lengths.split(",") if x.strip()]
+
+    q_lengths_filter: list[int] | None = [5] if args.q5_only else None
 
     run(
         args.output_dir,
@@ -471,6 +482,7 @@ def main() -> None:
         retry_oom_once=not args.no_retry_oom,
         force=args.force,
         regenerate_q_lengths=q_lengths,
+        q_lengths_filter=q_lengths_filter,
     )
 
 
