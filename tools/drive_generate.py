@@ -242,7 +242,7 @@ def _row_to_generate_kwargs(row: dict, device: str | None, seed: int | None, _jo
         "num_heads": int(row["num_heads"]),
         "num_kv_heads": int(row["num_kv_heads"]),
         "attn_type": row["attn_type"],
-        "q_phase": "prefill" if q_len > 2 else "causal",
+        "q_phase": "causal" if q_len > 2 else "prefill",
         "num_batches": 1,
         "seed": seed if seed is not None else DEFAULT_SEED,
         "device": device,

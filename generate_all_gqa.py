@@ -125,7 +125,7 @@ def generate_all_gqa(
                         kv_dist = (dist_key, kv_mean)
                         for q_len in Q_LENGTHS:
                             q_resolved = _resolve_q_length(q_len)
-                            q_phase = "prefill" if q_resolved > 2 else "causal"
+                            q_phase = "causal" if q_resolved > 2 else "prefill"
                             for head in HEAD_SIZES:
                                 attn_type = "gqa"
                                 name = _filename(

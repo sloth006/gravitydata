@@ -17,16 +17,25 @@ def _recompute_attn_mha(
     v: torch.Tensor,
     kv_mask: torch.Tensor,
     scale: float | None = None,
+    *,
+    q_phase: str = "prefill",
 ) -> torch.Tensor:
     """Recompute MHA attention: same head count for Q,K,V. Used to verify stored attn_out."""
     B, _, Q_len, _ = q.shape
     Kv_len = k.shape[2]
     scale = scale or (q.shape[-1] ** -0.5)
-    attn_mask = torch.where(
-        kv_mask.expand(B, 1, Q_len, Kv_len) > 0.5,
-        0.0,
-        float("-inf"),
-    ).to(q.dtype)
+    allowed = kv_mask.expand(B, 1, Q_len, Kv_len) > 0.5
+    if q_phase == "causal":
+        # Match dataset.py causal masking:
+        # abs_q_pos = (seq_lens - Q_len) + q_pos; allow kv_pos <= abs_q_pos.
+        seq_lens = kv_mask.sum(dim=-1, keepdim=True)
+        q_pos = torch.arange(Q_len, device=q.device, dtype=seq_lens.dtype).view(1, 1, Q_len, 1)
+        abs_q_pos = (seq_lens - Q_len) + q_pos
+        kv_pos = torch.arange(Kv_len, device=q.device, dtype=seq_lens.dtype).view(1, 1, 1, Kv_len)
+        causal_allow = kv_pos <= abs_q_pos
+        allowed = allowed & causal_allow
+
+    attn_mask = torch.where(allowed, 0.0, float("-inf")).to(q.dtype)
     return F.scaled_dot_product_attention(
         q, k, v,
         attn_mask=attn_mask,
@@ -43,13 +52,42 @@ def _recompute_attn_gqa(
     num_heads: int,
     num_kv_heads: int,
     scale: float | None = None,
+    *,
+    q_phase: str = "prefill",
 ) -> torch.Tensor | None:
     """
-    Recompute GQA attention (Q has num_heads, K/V have num_kv_heads).
-    TODO: Replace with your GQA kernel / custom calculation; then return the tensor
-    so tests can compare to stored attn_out. Empty for now.
+    Recompute GQA attention using the same masking semantics as dataset.py.
     """
-    return None
+    B, Hq, Q_len, _ = q.shape
+    H_kv = k.shape[1]
+    Kv_len = k.shape[2]
+    scale = scale or (q.shape[-1] ** -0.5)
+
+    # Expand K/V to Q head count (same approach dataset.py uses internally).
+    if H_kv != Hq:
+        repeat = Hq // H_kv
+        k_exp = k.repeat_interleave(repeat, dim=1)
+        v_exp = v.repeat_interleave(repeat, dim=1)
+    else:
+        k_exp = k
+        v_exp = v
+
+    allowed = kv_mask.expand(B, 1, Q_len, Kv_len) > 0.5
+    if q_phase == "causal":
+        seq_lens = kv_mask.sum(dim=-1, keepdim=True)
+        q_pos = torch.arange(Q_len, device=q.device, dtype=seq_lens.dtype).view(1, 1, Q_len, 1)
+        abs_q_pos = (seq_lens - Q_len) + q_pos
+        kv_pos = torch.arange(Kv_len, device=q.device, dtype=seq_lens.dtype).view(1, 1, 1, Kv_len)
+        causal_allow = kv_pos <= abs_q_pos
+        allowed = allowed & causal_allow
+
+    attn_mask = torch.where(allowed, 0.0, float("-inf")).to(q.dtype)
+    return F.scaled_dot_product_attention(
+        q, k_exp, v_exp,
+        attn_mask=attn_mask,
+        scale=scale,
+        dropout_p=0.0,
+    )
 
 
 def _recompute_attn_mla(
@@ -101,9 +139,10 @@ def test_mha_1() -> None:
         num_kv_heads=2,
         attn_type="mha",
         seed=1,
+        q_phase="causal",
         device="cpu",
     )
-    out = _recompute_attn_mha(data["q"], data["k"], data["v"], data["kv_mask"])
+    out = _recompute_attn_mha(data["q"], data["k"], data["v"], data["kv_mask"], q_phase="causal")
     assert _check_close(data["attn_out"], out, label="MHA test 1"), "MHA test 1: attn_out mismatch"
 
 
@@ -119,9 +158,10 @@ def test_mha_2() -> None:
         num_kv_heads=1,
         attn_type="mha",
         seed=42,
+        q_phase="causal",
         device="cpu",
     )
-    out = _recompute_attn_mha(data["q"], data["k"], data["v"], data["kv_mask"])
+    out = _recompute_attn_mha(data["q"], data["k"], data["v"], data["kv_mask"], q_phase="causal")
     assert _check_close(data["attn_out"], out, label="MHA test 2"), "MHA test 2: attn_out mismatch"
 
 
@@ -137,9 +177,10 @@ def test_mha_3() -> None:
         num_kv_heads=4,
         attn_type="mha",
         seed=123,
+        q_phase="prefill",
         device="cpu",
     )
-    out = _recompute_attn_mha(data["q"], data["k"], data["v"], data["kv_mask"])
+    out = _recompute_attn_mha(data["q"], data["k"], data["v"], data["kv_mask"], q_phase="prefill")
     assert _check_close(data["attn_out"], out, label="MHA test 3"), "MHA test 3: attn_out mismatch"
 
 
@@ -155,11 +196,13 @@ def test_gqa_1() -> None:
         num_kv_heads=1,
         attn_type="gqa",
         seed=10,
+        q_phase="causal",
         device="cpu",
     )
     out = _recompute_attn_gqa(
         data["q"], data["k"], data["v"], data["kv_mask"],
         data["num_heads"].item(), data["num_kv_heads"].item(),
+        q_phase="causal",
     )
     if out is not None:
         assert _check_close(data["attn_out"], out, label="GQA test 1"), "GQA test 1: attn_out mismatch"
@@ -177,11 +220,13 @@ def test_gqa_2() -> None:
         num_kv_heads=2,
         attn_type="gqa",
         seed=20,
+        q_phase="causal",
         device="cpu",
     )
     out = _recompute_attn_gqa(
         data["q"], data["k"], data["v"], data["kv_mask"],
         data["num_heads"].item(), data["num_kv_heads"].item(),
+        q_phase="causal",
     )
     if out is not None:
         assert _check_close(data["attn_out"], out, label="GQA test 2"), "GQA test 2: attn_out mismatch"
@@ -199,11 +244,13 @@ def test_gqa_3() -> None:
         num_kv_heads=1,
         attn_type="gqa",
         seed=30,
+        q_phase="prefill",
         device="cpu",
     )
     out = _recompute_attn_gqa(
         data["q"], data["k"], data["v"], data["kv_mask"],
         data["num_heads"].item(), data["num_kv_heads"].item(),
+        q_phase="prefill",
     )
     if out is not None:
         assert _check_close(data["attn_out"], out, label="GQA test 3"), "GQA test 3: attn_out mismatch"

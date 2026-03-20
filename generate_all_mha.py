@@ -120,7 +120,7 @@ def generate_all_mha(
                                 "head_dim": head,
                                 "attn_type": attn_type,
                             }
-                            q_phase = "prefill" if q_resolved > 2 else "causal"
+                            q_phase = "causal" if q_resolved > 2 else "prefill"
                             if path.exists() and not force:
                                 total_bytes += path.stat().st_size
                                 rows.append(row_data)

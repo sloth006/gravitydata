@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 import math
 import random
-from typing import Callable, Literal, Union
+from typing import Literal, Union
 
 import numpy as np
 import torch
@@ -200,108 +200,141 @@ def generate_dataset(
     def rand(*shape: int) -> torch.Tensor:
         return torch.randn(shape, device=device, dtype=dtype)
 
-    def _finalize_kv_values(values: torch.Tensor) -> torch.Tensor:
+    def _normalize_and_round(floats: torch.Tensor, target_mean: float) -> torch.Tensor:
         """
-        Round KV-length samples to integers and clamp to at least 1.
-        """
-        values = torch.clamp(values, min=1.0)
-        return torch.round(values).to(torch.int64)
+        Largest Remainder Method mean-match.
 
-    def _match_target_mean(values: torch.Tensor, target_mean: float) -> torch.Tensor:
+        Produces int64 values with total sum exactly matching:
+            target_sum = round(target_mean * N)
+        where N = floats.numel().
         """
-        Adjust real-valued KV-length samples so that their integer-rounded version
-        has mean close to target_mean (torch version of the numpy helper).
-        """
-        if values.numel() == 0:
-            return values
-        cur_mean = values.mean().clamp_min(1e-6)
-        scaled = values * (target_mean / cur_mean)
-        finalized = _finalize_kv_values(scaled).to(torch.float32)
-        final_mean = finalized.mean().clamp_min(1e-6)
-        corrected = finalized * (target_mean / final_mean)
-        return _finalize_kv_values(corrected)
+        N = int(floats.numel())
+        if N == 0:
+            return torch.zeros((0,), dtype=torch.int64, device=floats.device)
 
-    def make_kv_sampler() -> Callable[[], int]:
+        target_sum = int(round(float(target_mean) * N))
+        floats = floats.to(torch.float32)
+        scaled = (floats / floats.sum()) * float(target_sum)
+        floored = torch.floor(scaled)
+        diff = target_sum - int(floored.sum().item())
+        remainders = scaled - floored
+
+        if diff > 0:
+            top_idx = torch.topk(remainders, k=diff, largest=True).indices
+            floored[top_idx] = floored[top_idx] + 1.0
+        # If diff <= 0, floored already sums to target_sum (or we hit numeric edge cases).
+
+        finalized = torch.clamp(floored, min=1.0)
+
+        # Enforce exact sum matching even if clamp increased some zeros to ones.
+        # (This keeps the "strict mean-matching" promise.)
+        final_sum = int(finalized.sum().item())
+        delta = final_sum - target_sum
+        if delta > 0:
+            eligible = torch.nonzero(finalized > 1.0, as_tuple=False).squeeze(1)
+            if eligible.numel() > 0:
+                # Remove -1 from elements with the smallest original scaled contribution.
+                eligible_scaled = scaled[eligible]
+                dec_idx_in_eligible = torch.topk(-eligible_scaled, k=min(delta, eligible.numel())).indices
+                dec_idx = eligible[dec_idx_in_eligible]
+                finalized[dec_idx] = finalized[dec_idx] - 1.0
+
+        return finalized.to(torch.int64)
+
+    def generate_kv_lengths(N: int) -> torch.Tensor:
+        """
+        Vectorized KV length generator (int64 tensor of shape [N]).
+        """
         dist = kv_cache_size_dist
+
+        if N == 0:
+            return torch.zeros((0,), dtype=torch.int64, device=device)
+
         if dist == "fixed":
             val = max(1, q_length)
-            return lambda: val
+            return torch.full((N,), val, dtype=torch.int64, device=device)
         if isinstance(dist, int):
             val = max(1, dist)
-            return lambda: val
+            return torch.full((N,), val, dtype=torch.int64, device=device)
+
         if isinstance(dist, (list, tuple)):
             n = len(dist)
+
+            # Legacy discrete/unparameterized distributions (no strict mean-matching).
             if n == 3 and dist[0] == "uniform":
                 a, b = int(dist[1]), int(dist[2])
-                return lambda: int(torch.randint(a, b + 1, (1,), device=device).item())
+                return torch.randint(a, b + 1, (N,), device=device, dtype=torch.int64).clamp_min(1)
+            if isinstance(dist, list) and dist and isinstance(dist[0], (list, tuple)):
+                lengths = torch.tensor([x[0] for x in dist], dtype=torch.int64, device=device)
+                weights = torch.tensor([x[1] for x in dist], dtype=torch.float32, device=device)
+                weights = weights / weights.sum()
+                idx = torch.multinomial(weights, N, replacement=True)
+                return lengths[idx].clamp_min(1)
+
+            # Target-mean distributions: strict normalization + Largest Remainder rounding.
             if n == 2 and dist[0] == "uniform":
                 m = float(dist[1])
                 low = max(1, int(m * 0.5))
                 high = max(low + 1, int(m * 1.5) + 1)
-                return lambda: int(torch.randint(low, high, (1,), device=device).item())
+                floats = low + (high - low) * torch.rand((N,), device=device, dtype=torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
+
             if n == 3 and dist[0] == "normal":
                 mean, std = float(dist[1]), float(dist[2])
-                return lambda: max(1, int(round(torch.normal(mean=mean, std=std, size=(1,), device=device).item())))
+                floats = torch.normal(mean=mean, std=std, size=(N,), device=device).to(torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=mean)
+
             if n == 2 and dist[0] == "normal":
                 m = float(dist[1])
                 std = max(m * 0.25, 1.0)
-                return lambda: max(1, int(round(torch.normal(mean=m, std=std, size=(1,), device=device).item())))
+                floats = torch.normal(mean=m, std=std, size=(N,), device=device).to(torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
+
             if n == 2 and dist[0] == "constant":
-                val = max(1, int(round(float(dist[1]))))
-                return lambda: val
+                m = float(dist[1])
+                floats = torch.full((N,), m, device=device, dtype=torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
+
             if n == 2 and dist[0] == "exp_soft":
                 m = float(dist[1])
                 scale = max(m * 0.8, 1.0)
                 rate = 1.0 / scale
-                return lambda: max(
-                    1,
-                    int(
-                        round(
-                            torch.distributions.Exponential(rate)
-                            .sample((1,))
-                            .item()
-                        )
-                    ),
-                )
+                floats = torch.distributions.Exponential(rate).sample((N,)).to(device=device, dtype=torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
+
             if n == 2 and dist[0] == "exp_hard":
                 m = float(dist[1])
                 scale_small = max(m * 0.18, 1.0)
                 scale_large = max(m * 4.2, 1.0)
                 rate_small = 1.0 / scale_small
                 rate_large = 1.0 / scale_large
+                selector = torch.rand((N,), device=device) < 0.8
 
-                def _sample_exp_hard() -> int:
-                    small = (
-                        torch.distributions.Exponential(rate_small)
-                        .sample((1,))
-                        .item()
-                    )
-                    large = (
-                        torch.distributions.Exponential(rate_large)
-                        .sample((1,))
-                        .item()
-                    )
-                    selector = torch.rand(1, device=device).item() < 0.8
-                    val = small if selector else large
-                    return max(1, int(round(val)))
+                small = torch.distributions.Exponential(rate_small).sample((N,)).to(device=device, dtype=torch.float32)
+                large = torch.distributions.Exponential(rate_large).sample((N,)).to(device=device, dtype=torch.float32)
+                floats = torch.where(selector, small, large)
+                # Match legacy behavior: lengths were `max(1, round(val))` per-sample.
+                # Pre-rounding reduces cases where normalization would allocate a 0 that
+                # later gets clamped to 1 (which would break exact sum matching).
+                floats = torch.round(floats)
+                floats = torch.clamp(floats, min=1.0)
+                return _normalize_and_round(floats, target_mean=m)
 
-                return _sample_exp_hard
             if n == 2 and dist[0] == "exp_soft_rev":
                 m = float(dist[1])
                 scale = max(m * 0.8, 1.0)
                 rate = 1.0 / scale
                 upper_bound = max(m * 3.0, 1.0)
+                base = torch.distributions.Exponential(rate).sample((N,)).to(device=device, dtype=torch.float32)
+                floats = upper_bound - base
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
 
-                def _sample_exp_soft_rev() -> int:
-                    base = (
-                        torch.distributions.Exponential(rate)
-                        .sample((1,))
-                        .item()
-                    )
-                    val = max(1.0, upper_bound - base)
-                    return max(1, int(round(val)))
-
-                return _sample_exp_soft_rev
             if n == 2 and dist[0] == "exp_hard_rev":
                 m = float(dist[1])
                 scale_small = max(m * 0.18, 1.0)
@@ -309,87 +342,60 @@ def generate_dataset(
                 rate_small = 1.0 / scale_small
                 rate_large = 1.0 / scale_large
                 upper_bound = max(m * 6.0, 1.0)
+                selector = torch.rand((N,), device=device) < 0.8
 
-                def _sample_exp_hard_rev() -> int:
-                    small = (
-                        torch.distributions.Exponential(rate_small)
-                        .sample((1,))
-                        .item()
-                    )
-                    large = (
-                        torch.distributions.Exponential(rate_large)
-                        .sample((1,))
-                        .item()
-                    )
-                    selector = torch.rand(1, device=device).item() < 0.8
-                    base = small if selector else large
-                    val = max(1.0, upper_bound - base)
-                    return max(1, int(round(val)))
+                small = torch.distributions.Exponential(rate_small).sample((N,)).to(device=device, dtype=torch.float32)
+                large = torch.distributions.Exponential(rate_large).sample((N,)).to(device=device, dtype=torch.float32)
+                base = torch.where(selector, small, large)
+                floats = upper_bound - base
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
 
-                return _sample_exp_hard_rev
             if n == 2 and dist[0] == "beta_soft":
                 m = float(dist[1])
                 scale = max(m * 2.0, 1.0)
                 alpha, beta_param = 0.5, 0.5
+                edge = torch.distributions.Beta(alpha, beta_param).sample((N,)).to(device=device, dtype=torch.float32)
+                floats = edge * scale
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
 
-                def _sample_beta_soft() -> int:
-                    edge = (
-                        torch.distributions.Beta(alpha, beta_param)
-                        .sample((1,))
-                        .item()
-                    )
-                    val = edge * scale
-                    return max(1, int(round(val)))
-
-                return _sample_beta_soft
             if n == 2 and dist[0] == "beta_hard":
                 m = float(dist[1])
                 base_scale = max(m * 4.5, 1.0)
                 alpha, beta_param = 0.08, 0.08
+                edge = torch.distributions.Beta(alpha, beta_param).sample((N,)).to(device=device, dtype=torch.float32)
 
-                def _sample_beta_hard() -> int:
-                    edge = (
-                        torch.distributions.Beta(alpha, beta_param)
-                        .sample((1,))
-                        .item()
-                    )
-                    if edge < 0.5:
-                        edge_val = 2.0 * ((edge / 2.0) ** 1.8)
-                    else:
-                        edge_val = 1.0 - 2.0 * (((1.0 - edge) / 2.0) ** 1.8)
-                    val = edge_val * base_scale
-                    if edge < 0.25:
-                        val *= 0.35
-                    elif edge > 0.75:
-                        val *= 1.75
-                    return max(1, int(round(val)))
+                left = edge < 0.5
+                edge_val = torch.empty_like(edge)
+                edge_val[left] = 2.0 * ((edge[left] / 2.0) ** 1.8)
+                edge_val[~left] = 1.0 - 2.0 * (((1.0 - edge[~left]) / 2.0) ** 1.8)
+                val = edge_val * base_scale
+                val = torch.where(edge < 0.25, val * 0.35, val)
+                val = torch.where(edge > 0.75, val * 1.75, val)
 
-                return _sample_beta_hard
+                # Match legacy behavior: lengths were `max(1, round(val))` per-sample.
+                floats = torch.round(val)
+                floats = torch.clamp(floats, min=1.0)
+                return _normalize_and_round(floats, target_mean=m)
+
             if n == 2 and dist[0] == "lognormal":
                 m = float(dist[1])
                 sigma = 0.5
-                mu = math.log(max(m, 1.0)) - 0.5 * (sigma ** 2)
-                return lambda: max(
-                    1,
-                    int(
-                        round(
-                            torch.distributions.LogNormal(mu, sigma)
-                            .sample((1,))
-                            .item()
-                        )
-                    ),
-                )
+                mu = math.log(max(m, 1.0)) - 0.5 * (sigma**2)
+                floats = torch.distributions.LogNormal(mu, sigma).sample((N,)).to(device=device, dtype=torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=m)
+
             if n == 2 and dist[0] == "poisson":
                 lam = float(dist[1])
-                return lambda: max(1, int(torch.poisson(torch.tensor(lam, device=device).expand(1)).item()))
-            if isinstance(dist, list) and dist and isinstance(dist[0], (list, tuple)):
-                lengths = torch.tensor([x[0] for x in dist], dtype=torch.float32, device=device)
-                weights = torch.tensor([x[1] for x in dist], dtype=torch.float32, device=device)
-                weights = weights / weights.sum()
-                return lambda: max(1, int(lengths[torch.multinomial(weights.unsqueeze(0), 1).item()].item()))
-        return lambda: max(1, q_length)
+                rate = torch.full((N,), lam, device=device, dtype=torch.float32)
+                floats = torch.poisson(rate).to(torch.float32)
+                floats = torch.clamp(floats, min=1e-6)
+                return _normalize_and_round(floats, target_mean=lam)
 
-    sample_kv_length = make_kv_sampler()
+        # Fallback to query length if distribution is unrecognized.
+        return torch.full((N,), max(1, q_length), dtype=torch.int64, device=device)
 
     out: dict[str, torch.Tensor] = {}
 
@@ -398,8 +404,9 @@ def generate_dataset(
     out["q"] = q
 
     if kv_cache:
-        kv_lengths = [sample_kv_length() for _ in range(batch_size * num_batches)]
-        max_kv_len = max(kv_lengths)
+        N = batch_size * num_batches
+        kv_lengths = generate_kv_lengths(N)
+        max_kv_len = int(kv_lengths.max().item())
 
         # K, V: (B, num_kv_heads, max_kv_len, head_size). For GQA, num_kv_heads < num_heads.
         k = rand(batch_size * num_batches, num_kv_heads, max_kv_len, head_size)
@@ -410,12 +417,13 @@ def generate_dataset(
             batch_size * num_batches, 1, 1, max_kv_len,
             device=device, dtype=dtype,
         )
-        for i, L in enumerate(kv_lengths):
+        kv_lengths_list = kv_lengths.to(device="cpu").tolist()
+        for i, L in enumerate(kv_lengths_list):
             mask[i, :, :, :L] = 1
 
         out["k"] = k
         out["v"] = v
-        out["kv_lengths"] = torch.tensor(kv_lengths, dtype=torch.int64, device=device)
+        out["kv_lengths"] = kv_lengths
         out["kv_mask"] = mask
 
         # Reference attention output (GQA: K/V expanded to num_heads inside _attention_forward)

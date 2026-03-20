@@ -305,12 +305,20 @@ Useful build filters:
 **2. Run and upload to Drive**
 
 ```bash
-python tools/drive_generate.py run \
+python3 tools/drive_generate.py run \
   --index-csv mha_fp16/index.csv \
   --auth oauth \
   --credentials-json /path/to/oauth-client-secrets.json \
   --drive-folder-id YOUR_FOLDER_ID \
-  --device cpu
+  --device cuda
+
+python3 generate_dataset4.py \
+  --output-dir datasets4 \
+  --device cuda:0 \
+  --drive-folder-id ID \
+  --auth oauth \
+  --credentials-json /home/file place/client_secret.json \
+  --token-json token.json
 ```
 
 What it does:

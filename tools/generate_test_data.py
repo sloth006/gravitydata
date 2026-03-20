@@ -37,6 +37,8 @@ def main() -> None:
         attn_type = cfg["attn_type"]
         path = out_dir / f"{name}.safetensors"
         kwargs = {k: v for k, v in cfg.items() if k not in ("name", "attn_type")}
+        # Match benchmark semantics: q_len > 2 is an autoregressive chunk => causal (triangular) masking.
+        kwargs["q_phase"] = "causal" if int(kwargs["q_length"]) > 2 else "prefill"
         kwargs["seed"] = SEED
         data = generate_dataset(
             kv_cache=True,

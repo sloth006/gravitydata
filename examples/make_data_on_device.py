@@ -92,7 +92,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=num_kv,
         attn_type=args.attn_type,
-        q_phase="prefill" if args.q_length > 2 else "causal",
+        q_phase="causal" if args.q_length > 2 else "prefill",
         num_batches=args.num_batches,
         seed=args.seed,
         device=args.device,
