@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import errno
 import gc
 import io
+import random
+import ssl
 import time
 from pathlib import Path
 
@@ -17,10 +20,29 @@ from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    """True for errors that often succeed on retry (TLS drops, resets, 5xx, rate limits)."""
+    if isinstance(exc, (ssl.SSLError, ConnectionError, TimeoutError, BrokenPipeError)):
+        return True
+    if isinstance(exc, OSError):
+        transient = {errno.ECONNRESET, errno.ETIMEDOUT, errno.EPIPE}
+        for _name in ("ECONNABORTED", "ENOTCONN"):
+            if hasattr(errno, _name):
+                transient.add(getattr(errno, _name))
+        if exc.errno is not None and exc.errno in transient:
+            return True
+    if isinstance(exc, HttpError):
+        status = int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
+        if status in (408, 429, 500, 502, 503, 504):
+            return True
+    return False
 
 
 class DriveUploader:
@@ -72,40 +94,79 @@ class DriveUploader:
                 self.token_json.write_text(creds.to_json(), encoding="utf-8")
         return creds
 
-    def upload_file(self, local_path: str | Path, remote_name: str | None = None) -> str:
+    def upload_file(
+        self,
+        local_path: str | Path,
+        remote_name: str | None = None,
+        *,
+        max_retries: int = 8,
+        base_delay_s: float = 2.0,
+    ) -> str:
+        """
+        Upload with retries around resumable chunks. SSLEOFError / connection drops
+        during long uploads are common; each retry restarts the resumable session.
+        """
         path = Path(local_path)
         if not path.exists():
             raise FileNotFoundError(path)
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
 
-        metadata = {
-            "name": remote_name or path.name,
-            "parents": [self.folder_id],
-        }
-        media = MediaFileUpload(str(path), mimetype="application/octet-stream", resumable=True)
-        request = self.service.files().create(
-            body=metadata,
-            media_body=media,
-            fields="id,name",
-            supportsAllDrives=True,
-        )
+        name = remote_name or path.name
 
-        response = None
-        while response is None:
-            _status, response = request.next_chunk()
-        return response["id"]
+        for attempt in range(max_retries):
+            try:
+                metadata = {
+                    "name": name,
+                    "parents": [self.folder_id],
+                }
+                media = MediaFileUpload(str(path), mimetype="application/octet-stream", resumable=True)
+                request = self.service.files().create(
+                    body=metadata,
+                    media_body=media,
+                    fields="id,name",
+                    supportsAllDrives=True,
+                )
 
-    def download_file(self, file_id: str, local_path: str | Path) -> Path:
+                response = None
+                while response is None:
+                    _status, response = request.next_chunk()
+                return response["id"]
+            except Exception as e:
+                if attempt >= max_retries - 1 or not _is_transient_network_error(e):
+                    raise
+                delay = base_delay_s * (2**attempt) + random.uniform(0, 1.0)
+                time.sleep(delay)
+
+    def download_file(
+        self,
+        file_id: str,
+        local_path: str | Path,
+        *,
+        max_retries: int = 8,
+        base_delay_s: float = 2.0,
+    ) -> Path:
         """Download a Drive file by ID to a local path. Returns the path."""
+        if max_retries < 1:
+            raise ValueError("max_retries must be >= 1")
         path = Path(local_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
-        done = False
-        while not done:
-            _status, done = downloader.next_chunk()
-        path.write_bytes(fh.getvalue())
-        return path
+
+        for attempt in range(max_retries):
+            try:
+                request = self.service.files().get_media(fileId=file_id, supportsAllDrives=True)
+                fh = io.BytesIO()
+                downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
+                done = False
+                while not done:
+                    _status, done = downloader.next_chunk()
+                path.write_bytes(fh.getvalue())
+                return path
+            except Exception as e:
+                if attempt >= max_retries - 1 or not _is_transient_network_error(e):
+                    raise
+                delay = base_delay_s * (2**attempt) + random.uniform(0, 1.0)
+                time.sleep(delay)
 
     def list_files_in_folder(self, folder_id: str | None = None) -> list[dict]:
         """List files in a Drive folder. Returns list of dicts with 'id' and 'name'."""

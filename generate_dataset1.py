@@ -1,18 +1,23 @@
 """
-generate_dataset1.py
-Generate a fixed subset of GQA datasets and track progress in a CSV.
+generate_dataset2.py
 
-Grid:
-  - batch: 1, 8, 16, 32, 64, 128
-  - dtype: bfloat16 only
-  - kv mean: 1, 500, 1000, 2000
-  - kv distribution: constant, exp_soft, exp_hard, exp_soft_rev, exp_hard_rev
-  - Q length: 1, 5
-  - head: 128
-  - attention: GQA (32q/8kv) and (64q/8kv)
+Generate a fixed subset of MHA + GQA datasets where:
+  - MHA: q=1 and q=5
+  - GQA: q=5 only
+and save to .safetensors,
+with optional Google Drive upload + Ctrl+C resume via index.csv.
 
-Stores .safetensors in out_dir and records work in index.csv. Supports Ctrl+C
-to stop (saves CSV) and continue on next run (skips already-generated files).
+Configs:
+  MHA:
+  - num_heads=32, num_kv_heads=32, head_dim=64
+  - num_heads=16, num_kv_heads=16, head_dim=128
+  GQA:
+  - num_heads=32, num_kv_heads=8, head_dim=128
+  - num_heads=64, num_kv_heads=8, head_dim=128
+
+This generator uses a CUDA-friendly attention path implemented with
+"memory streaming" (chunked KV softmax) to reduce peak attention memory.
+If generation/attention OOMs, the job is logged into oom_jobs.csv.
 """
 
 from __future__ import annotations
@@ -29,27 +34,6 @@ from dataset import DEFAULT_SEED, generate_dataset, save_dataset
 from tools.drive_utils import DriveUploader, ensure_memory_budget
 
 
-# --- Grid for generate_dataset1 ---
-BATCH_SIZES = [1, 8, 16, 32, 64, 128]
-DTYPE = "bfloat16"
-KV_MEANS = [1, 500, 1000, 2000]
-# (dist_type for filename, dist_key for generate_dataset). For kv_mean==1 only constant.
-KV_DISTRIBUTIONS = [
-    ("constant", "constant"),
-    ("exp_soft", "exp_soft"),
-    ("exp_hard", "exp_hard"),
-    ("exp_soft_rev", "exp_soft_rev"),
-    ("exp_hard_rev", "exp_hard_rev"),
-]
-Q_LENGTHS = [1, 5]
-HEAD_SIZE = 128
-# (num_heads, num_kv_heads)
-# 32q/8kv = 4:1 grouping; 64q/8kv = 8:1 grouping
-GQA_TYPES = [
-    (32, 8),  # 4:1
-    (64, 8),  # 8:1
-]
-
 STATUS_PENDING = "pending"
 STATUS_GENERATED = "generated"
 STATUS_UPLOADED = "uploaded"
@@ -58,27 +42,35 @@ STATUS_OOM = "oom"
 INDEX_FILENAME = "index.csv"
 OOM_FILENAME = "oom_jobs.csv"
 
-def _upload_csv_to_drive_replace(
-    uploader: DriveUploader,
-    local_path: Path,
-) -> str | None:
-    """
-    Upload a CSV to Drive, replacing any existing file in the target folder
-    with the same remote name.
-    """
-    if not local_path.exists():
-        return None
 
-    # Best-effort delete same-name files to keep "latest" semantics.
-    try:
-        for f in uploader.list_files_in_folder():
-            if f.get("name") == local_path.name and f.get("id"):
-                uploader.service.files().delete(fileId=f["id"]).execute()
-    except Exception:
-        # If delete fails, we still attempt upload (may create duplicates).
-        pass
+DTYPE = "bfloat16"
+HEAD_SIZE_128 = 128
+HEAD_SIZE_64 = 64
 
-    return uploader.upload_file(local_path, remote_name=local_path.name)
+# Same batch sizes and KV distributions as generate_dataset1.py
+BATCH_SIZES = [1, 8, 16, 32, 64, 128]
+KV_MEANS = [1, 500, 1000, 2000]
+KV_DISTRIBUTIONS = [
+    ("constant", "constant"),
+    ("exp_soft", "exp_soft"),
+    ("exp_hard", "exp_hard"),
+    ("exp_soft_rev", "exp_soft_rev"),
+    ("exp_hard_rev", "exp_hard_rev"),
+]
+
+Q_LENGTHS = [1, 5]
+
+# MHA: (num_heads, num_kv_heads, head_dim)
+MHA_TYPES: list[tuple[int, int, int]] = [
+    (32, 32, HEAD_SIZE_64),
+    (16, 16, HEAD_SIZE_128),
+]
+
+# GQA: (num_heads, num_kv_heads, head_dim)
+GQA_TYPES: list[tuple[int, int, int]] = [
+    (32, 8, HEAD_SIZE_128),
+    (64, 8, HEAD_SIZE_128),
+]
 
 
 def _filename(
@@ -98,48 +90,19 @@ def _filename(
     )
 
 
-def _build_job_rows(out_dir: Path, q_lengths_filter: list[int] | None = None) -> list[dict]:
-    """Build full list of job rows (path, params, status=pending).
-    If q_lengths_filter is set, only those q lengths are included (e.g. [5] for q=5 only).
-    """
-    q_lens = q_lengths_filter if q_lengths_filter is not None else Q_LENGTHS
-    rows: list[dict] = []
-    for num_heads, num_kv_heads in GQA_TYPES:
-        ratio_dir = out_dir / f"gqa_{num_heads}_{num_kv_heads}" / "bf16"
-        ratio_dir.mkdir(parents=True, exist_ok=True)
-        for batch in BATCH_SIZES:
-            for kv_mean in KV_MEANS:
-                dists = KV_DISTRIBUTIONS if kv_mean > 1 else [KV_DISTRIBUTIONS[0]]
-                for kv_dist_type, dist_key in dists:
-                    kv_dist = (dist_key, kv_mean)
-                    for q_len in q_lens:
-                        name = _filename(
-                            DTYPE,
-                            kv_dist_type,
-                            kv_mean,
-                            batch,
-                            q_len,
-                            num_kv_heads,
-                            num_heads,
-                            HEAD_SIZE,
-                            "gqa",
-                        )
-                        path = ratio_dir / name
-                        rows.append({
-                            "path": str(path),
-                            "dtype": DTYPE,
-                            "kv_dist_type": kv_dist_type,
-                            "kv_mean": kv_mean,
-                            "batch": batch,
-                            "q_len": q_len,
-                            "num_kv_heads": num_kv_heads,
-                            "num_heads": num_heads,
-                            "head_dim": HEAD_SIZE,
-                            "attn_type": "gqa",
-                            "status": STATUS_PENDING,
-                            "kv_dist": kv_dist,
-                        })
-    return rows
+def _upload_csv_to_drive_replace(
+    uploader: DriveUploader,
+    local_path: Path,
+) -> str | None:
+    if not local_path.exists():
+        return None
+    try:
+        for f in uploader.list_files_in_folder():
+            if f.get("name") == local_path.name and f.get("id"):
+                uploader.service.files().delete(fileId=f["id"]).execute()
+    except Exception:
+        pass
+    return uploader.upload_file(local_path, remote_name=local_path.name)
 
 
 def _load_index(index_path: Path) -> list[dict]:
@@ -154,7 +117,6 @@ def _load_index(index_path: Path) -> list[dict]:
 
 
 def _merge_with_existing_index(fresh_rows: list[dict], index_path: Path) -> list[dict]:
-    """Merge fresh job list with existing index: keep status for same path."""
     existing = _load_index(index_path)
     path_to_status = {r["path"]: r.get("status", STATUS_PENDING) for r in existing}
     path_to_drive_id = {r["path"]: (r.get("drive_file_id", "") or "") for r in existing}
@@ -168,8 +130,18 @@ def _write_index(rows: list[dict], index_path: Path) -> None:
     if not rows:
         return
     fieldnames = [
-        "path", "dtype", "kv_dist_type", "kv_mean", "batch", "q_len",
-        "num_kv_heads", "num_heads", "head_dim", "attn_type", "status", "drive_file_id",
+        "path",
+        "dtype",
+        "kv_dist_type",
+        "kv_mean",
+        "batch",
+        "q_len",
+        "num_kv_heads",
+        "num_heads",
+        "head_dim",
+        "attn_type",
+        "status",
+        "drive_file_id",
     ]
     index_path.parent.mkdir(parents=True, exist_ok=True)
     with index_path.open("w", newline="", encoding="utf-8") as f:
@@ -188,6 +160,253 @@ def _write_oom(oom_rows: list[dict], oom_path: Path) -> None:
         writer.writerows(oom_rows)
 
 
+def _build_job_rows(out_dir: Path) -> list[dict]:
+    rows: list[dict] = []
+    for num_heads, num_kv_heads, head_dim in MHA_TYPES:
+        ratio_dir = out_dir / f"mha_{num_heads}_{num_kv_heads}" / "bf16"
+        ratio_dir.mkdir(parents=True, exist_ok=True)
+        for batch in BATCH_SIZES:
+            for kv_mean in KV_MEANS:
+                dists = KV_DISTRIBUTIONS if kv_mean > 1 else [KV_DISTRIBUTIONS[0]]
+                for kv_dist_type, dist_key in dists:
+                    for q_len in Q_LENGTHS:
+                        name = _filename(
+                            DTYPE,
+                            kv_dist_type,
+                            kv_mean,
+                            batch,
+                            q_len,
+                            num_kv_heads,
+                            num_heads,
+                            head_dim,
+                            "mha",
+                        )
+                        path = ratio_dir / name
+                        rows.append(
+                            {
+                                "path": str(path),
+                                "dtype": DTYPE,
+                                "kv_dist_type": kv_dist_type,
+                                "kv_mean": kv_mean,
+                                "batch": batch,
+                                "q_len": q_len,
+                                "num_kv_heads": num_kv_heads,
+                                "num_heads": num_heads,
+                                "head_dim": head_dim,
+                                "attn_type": "mha",
+                                "status": STATUS_PENDING,
+                                "kv_dist": (dist_key, kv_mean),
+                            }
+                        )
+
+    for num_heads, num_kv_heads, head_dim in GQA_TYPES:
+        ratio_dir = out_dir / f"gqa_{num_heads}_{num_kv_heads}" / "bf16"
+        ratio_dir.mkdir(parents=True, exist_ok=True)
+        for batch in BATCH_SIZES:
+            for kv_mean in KV_MEANS:
+                dists = KV_DISTRIBUTIONS if kv_mean > 1 else [KV_DISTRIBUTIONS[0]]
+                for kv_dist_type, dist_key in dists:
+                    # For GQA, only generate q_length=5.
+                    for q_len in [5]:
+                        name = _filename(
+                            DTYPE,
+                            kv_dist_type,
+                            kv_mean,
+                            batch,
+                            q_len,
+                            num_kv_heads,
+                            num_heads,
+                            head_dim,
+                            "gqa",
+                        )
+                        path = ratio_dir / name
+                        rows.append(
+                            {
+                                "path": str(path),
+                                "dtype": DTYPE,
+                                "kv_dist_type": kv_dist_type,
+                                "kv_mean": kv_mean,
+                                "batch": batch,
+                                "q_len": q_len,
+                                "num_kv_heads": num_kv_heads,
+                                "num_heads": num_heads,
+                                "head_dim": head_dim,
+                                "attn_type": "gqa",
+                                "status": STATUS_PENDING,
+                                "kv_dist": (dist_key, kv_mean),
+                            }
+                        )
+    return rows
+
+
+@torch.inference_mode()
+def _attention_forward_chunked_mha(
+    q: torch.Tensor,  # (B,H,Q,d) on CUDA
+    k: torch.Tensor,  # (B,H,K,d) on CPU or CUDA
+    v: torch.Tensor,  # (B,H,K,d) on CPU or CUDA
+    kv_lengths: torch.Tensor,  # (B,) int64 (CPU or CUDA)
+    *,
+    q_phase: str,
+    chunk_kv: int = 128,
+) -> torch.Tensor:
+    """
+    Memory-streaming attention for MHA that avoids allocating (B,H,Q,K).
+
+    Mask semantics match `dataset.py`:
+    - "prefill": only padding mask (kv_pos < kv_length)
+    - "causal": additionally apply the `causal_allow` condition from `dataset.py`.
+    """
+    assert q.is_cuda
+    if q_phase not in {"prefill", "causal"}:
+        raise ValueError(f"Unknown q_phase: {q_phase}")
+
+    B, H, Q_len, d = q.shape
+    K = k.shape[2]
+    scale = d**-0.5
+
+    q_device = q.device
+    kv_lengths = kv_lengths.to(q_device)
+
+    # Float32 streaming accumulators (prevents dtype mismatch).
+    qf = q.float()
+    m = torch.full((B, H, Q_len), float("-inf"), device=q_device, dtype=torch.float32)
+    l = torch.zeros((B, H, Q_len), device=q_device, dtype=torch.float32)
+    out = torch.zeros((B, H, Q_len, d), device=q_device, dtype=torch.float32)
+
+    q_pos = torch.arange(Q_len, device=q_device, dtype=kv_lengths.dtype).view(1, 1, Q_len)
+    if q_phase == "causal":
+        # dataset.py causal: abs_q_pos = (seq_lens - Q_len) + q_pos
+        abs_q_pos = (kv_lengths.view(B, 1, 1) - Q_len) + q_pos  # (B,1,Q_len)
+    else:
+        abs_q_pos = None
+
+    for start in range(0, K, chunk_kv):
+        end = min(K, start + chunk_kv)
+        kv_pos_chunk = torch.arange(start, end, device=q_device, dtype=kv_lengths.dtype)  # (chunk,)
+
+        # Move only the current KV chunk to GPU.
+        k_chunk = k[:, :, start:end, :].to(q_device)  # (B,H,chunk,d)
+        v_chunk = v[:, :, start:end, :].to(q_device)  # (B,H,chunk,d)
+        kf_chunk = k_chunk.float()
+        vf_chunk = v_chunk.float()
+
+        # scores: (B,H,Q,chunk)
+        scores = torch.matmul(qf, kf_chunk.transpose(-1, -2)) * scale
+
+        # padding: kv_pos < kv_length
+        padding_valid = kv_pos_chunk.view(1, 1, 1, -1) < kv_lengths.view(B, 1, 1, 1)  # (B,1,1,chunk)->broadcast
+        allowed = padding_valid
+
+        if q_phase == "causal":
+            # causal_allow: kv_pos <= abs_q_pos
+            causal_allow = kv_pos_chunk.view(1, 1, 1, -1) <= abs_q_pos.view(B, 1, Q_len, 1)  # (B,1,Q,chunk)
+            allowed = allowed & causal_allow
+
+        scores = scores.masked_fill(~allowed, float("-inf"))
+
+        max_chunk = scores.max(dim=-1).values  # (B,H,Q)
+        m_new = torch.maximum(m, max_chunk)
+
+        # Safe m_new: replace -inf with 0.0 just for the subtraction to prevent NaNs.
+        m_safe = m_new.masked_fill(m_new == float("-inf"), 0.0)
+        exp_scores = torch.exp(scores - m_safe.unsqueeze(-1))  # (B,H,Q,chunk)
+
+        exp_m_factor = torch.exp(m - m_new)  # (B,H,Q)
+        exp_m_factor = torch.nan_to_num(exp_m_factor, nan=0.0)
+
+        l = l * exp_m_factor + exp_scores.sum(dim=-1)
+        out = out * exp_m_factor.unsqueeze(-1) + torch.matmul(exp_scores, vf_chunk)
+        m = m_new
+
+    out = out / l.unsqueeze(-1).clamp(min=1e-9)
+    return out.to(q.dtype)
+
+
+def _attention_forward_chunked_gqa(
+    q: torch.Tensor,  # (B,Hq,Q,d) on CUDA
+    k: torch.Tensor,  # (B,Hkv,K,d) on CPU or CUDA
+    v: torch.Tensor,  # (B,Hkv,K,d) on CPU or CUDA
+    kv_lengths: torch.Tensor,  # (B,) int64
+    *,
+    q_phase: str,
+    chunk_kv: int = 128,
+) -> torch.Tensor:
+    """
+    Memory-streaming attention for GQA without explicitly repeating K/V heads.
+    Groups query heads by their KV head mapping (consistent with `repeat_interleave`).
+    """
+    assert q.is_cuda
+    if q_phase not in {"prefill", "causal"}:
+        raise ValueError(f"Unknown q_phase: {q_phase}")
+
+    B, Hq, Q_len, d = q.shape
+    Hkv = k.shape[1]
+    if Hq % Hkv != 0:
+        raise ValueError("For GQA, Hq must be divisible by Hkv")
+    repeat_q = Hq // Hkv
+    K = k.shape[2]
+    scale = d**-0.5
+
+    q_device = q.device
+    kv_lengths = kv_lengths.to(q_device)
+    qf_group = q.float().view(B, Hkv, repeat_q, Q_len, d)  # (B,Hkv,repeat,Q,d)
+
+    # Float32 accumulators for grouped heads.
+    m = torch.full((B, Hkv, repeat_q, Q_len), float("-inf"), device=q_device, dtype=torch.float32)
+    l = torch.zeros((B, Hkv, repeat_q, Q_len), device=q_device, dtype=torch.float32)
+    out = torch.zeros((B, Hkv, repeat_q, Q_len, d), device=q_device, dtype=torch.float32)
+
+    q_pos = torch.arange(Q_len, device=q_device, dtype=kv_lengths.dtype).view(1, Q_len)  # (1,Q)
+    if q_phase == "causal":
+        abs_q_pos = (kv_lengths.view(B, 1) - Q_len) + q_pos  # (B,Q)
+    else:
+        abs_q_pos = None
+
+    for start in range(0, K, chunk_kv):
+        end = min(K, start + chunk_kv)
+        kv_pos_chunk = torch.arange(start, end, device=q_device, dtype=kv_lengths.dtype)  # (chunk,)
+
+        k_chunk = k[:, :, start:end, :].to(q_device)  # (B,Hkv,chunk,d)
+        v_chunk = v[:, :, start:end, :].to(q_device)  # (B,Hkv,chunk,d)
+        kf_chunk = k_chunk.float().unsqueeze(2)
+        vf_chunk = v_chunk.float().unsqueeze(2)
+
+        # scores: (B,Hkv,repeat,Q,chunk)
+        scores = torch.matmul(
+            qf_group,
+            kf_chunk.transpose(-1, -2),  # (B,Hkv,d,chunk)
+        ) * scale
+
+        # padding_valid: kv_pos < kv_length
+        padding_valid = kv_pos_chunk.view(1, 1, 1, 1, -1) < kv_lengths.view(B, 1, 1, 1, 1)  # (B,1,1,1,chunk)
+        allowed = padding_valid
+
+        if q_phase == "causal":
+            # causal_allow: kv_pos <= abs_q_pos
+            causal_allow = kv_pos_chunk.view(1, 1, 1, 1, -1) <= abs_q_pos.view(B, 1, 1, Q_len, 1)  # (B,1,1,Q,chunk)
+            allowed = allowed & causal_allow
+
+        scores = scores.masked_fill(~allowed, float("-inf"))
+
+        max_chunk = scores.max(dim=-1).values  # (B,Hkv,repeat,Q)
+        m_new = torch.maximum(m, max_chunk)
+
+        # Safe m_new: replace -inf with 0.0 just for the subtraction to prevent NaNs.
+        m_safe = m_new.masked_fill(m_new == float("-inf"), 0.0)
+        exp_scores = torch.exp(scores - m_safe.unsqueeze(-1))  # (B,Hkv,repeat,Q,chunk)
+
+        exp_m_factor = torch.exp(m - m_new)  # (B,Hkv,repeat,Q)
+        exp_m_factor = torch.nan_to_num(exp_m_factor, nan=0.0)
+
+        l = l * exp_m_factor + exp_scores.sum(dim=-1)
+        out = out * exp_m_factor.unsqueeze(-1) + torch.matmul(exp_scores, vf_chunk)
+        m = m_new
+
+    out = out / l.unsqueeze(-1).clamp(min=1e-9)
+    out = out.reshape(B, Hq, Q_len, d)
+    return out.to(q.dtype)
+
+
 def run(
     out_dir: str | Path,
     *,
@@ -201,38 +420,21 @@ def run(
     delete_after_upload: bool = True,
     min_cpu_free_gb: float = 1.0,
     min_gpu_free_gb: float = 1.0,
-    retry_oom_once: bool = True,
-    force: bool = False,
-    regenerate_q_lengths: list[int] | None = None,
-    q_lengths_filter: list[int] | None = None,
+    chunk_kv: int = 128,
 ) -> None:
     out_path = Path(out_dir).resolve()
     out_path.mkdir(parents=True, exist_ok=True)
     index_path = out_path / INDEX_FILENAME
     oom_path = out_path / OOM_FILENAME
 
-    # Build full job list and merge with existing index so we preserve status
-    fresh_rows = _build_job_rows(out_path, q_lengths_filter=q_lengths_filter)
+    fresh_rows = _build_job_rows(out_path)
     rows = _merge_with_existing_index(fresh_rows, index_path)
     total = len(rows)
+
     def is_pending(row: dict) -> bool:
-        # Regenerate override modes.
-        if force:
-            return True
-
-        if regenerate_q_lengths is not None:
-            try:
-                q_len = int(row.get("q_len"))
-            except (TypeError, ValueError):
-                q_len = int(float(row.get("q_len")))
-            if q_len in regenerate_q_lengths:
-                return True
-
         status = (row.get("status") or "").strip().lower()
         if status in {STATUS_GENERATED, STATUS_UPLOADED}:
             return False
-        # If we have a Drive file id recorded, treat it as done even if the local file
-        # was deleted after upload.
         if (row.get("drive_file_id") or "").strip():
             return False
         if Path(row["path"]).exists():
@@ -263,11 +465,11 @@ def run(
     if oom_path.exists():
         oom_rows = _load_index(oom_path)
 
-    interrupted = [False]  # use list so inner function can set it
+    interrupted = [False]
 
     def on_sigint(*_args):  # noqa: ARG001
         interrupted[0] = True
-        signal.signal(signal.SIGINT, signal.SIG_DFL)  # allow second Ctrl+C to kill
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
 
     signal.signal(signal.SIGINT, on_sigint)
 
@@ -277,7 +479,6 @@ def run(
             if interrupted[0]:
                 print("\nCtrl+C received. Saving index and exiting.")
                 break
-            path = Path(row["path"])
             if not is_pending(row):
                 done += 1
                 continue
@@ -290,6 +491,10 @@ def run(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+                # Generate q/k/v on CPU to avoid GPU allocation spikes.
+                q_len = int(row["q_len"])
+                q_phase = "causal" if q_len > 2 else "prefill"
                 data = generate_dataset(
                     batch_size=int(row["batch"]),
                     dtype=row["dtype"],
@@ -300,26 +505,41 @@ def run(
                     num_heads=int(row["num_heads"]),
                     num_kv_heads=int(row["num_kv_heads"]),
                     attn_type=row["attn_type"],
-                    q_phase="prefill" if int(row["q_len"]) > 2 else "causal",
+                    compute_attn_out=False,
+                    q_phase=q_phase,
                     num_batches=1,
                     seed=seed,
-                    device=device,
+                    device="cpu",
                     deterministic=deterministic,
                 )
+
+                # Compute attention on GPU with chunked KV softmax.
+                q = data["q"].to(device)
+                k = data["k"]
+                v = data["v"]
+                kv_lengths = data["kv_lengths"].to(torch.int64)
+
+                if row["attn_type"] == "mha":
+                    attn_out = _attention_forward_chunked_mha(
+                        q, k, v, kv_lengths, q_phase=q_phase, chunk_kv=chunk_kv
+                    )
+                else:
+                    attn_out = _attention_forward_chunked_gqa(
+                        q, k, v, kv_lengths, q_phase=q_phase, chunk_kv=chunk_kv
+                    )
+                # Move back to CPU for saving.
+                data["attn_out"] = attn_out.cpu()
+
                 save_dataset(data, row["path"])
-                del data
+                del data, q, k, v, attn_out
                 row["status"] = STATUS_GENERATED
 
                 if uploader is not None:
-                    # Upload and optionally delete local file.
-                    file_id = uploader.upload_file(path, remote_name=path.name)
+                    file_id = uploader.upload_file(Path(row["path"]), remote_name=Path(row["path"]).name)
                     row["drive_file_id"] = file_id
                     row["status"] = STATUS_UPLOADED
                     if delete_after_upload:
-                        try:
-                            path.unlink()
-                        except FileNotFoundError:
-                            pass
+                        Path(row["path"]).unlink(missing_ok=True)
 
                 done += 1
                 if done % 50 == 0:
@@ -335,85 +555,15 @@ def run(
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                print(f"  OOM: {path.name} (logged to {OOM_FILENAME})")
+                print(f"  OOM: {Path(row['path']).name} (logged to {OOM_FILENAME})")
             finally:
                 _write_index(rows, index_path)
-
-        # Optional: retry OOM jobs once at the end. This is useful if memory pressure
-        # was temporary (other processes, fragmentation, etc.).
-        if retry_oom_once and not interrupted[0]:
-            oom_candidates = [r for r in rows if (r.get("status") == STATUS_OOM)]
-            if oom_candidates:
-                print(f"\nRetrying OOM jobs once: {len(oom_candidates)} job(s).")
-                still_oom: list[dict] = []
-                for row in oom_candidates:
-                    if interrupted[0]:
-                        print("\nCtrl+C received during OOM retry. Saving index and exiting.")
-                        break
-                    path = Path(row["path"])
-                    try:
-                        ensure_memory_budget(
-                            device=device,
-                            min_cpu_free_gb=min_cpu_free_gb,
-                            min_gpu_free_gb=min_gpu_free_gb,
-                        )
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        data = generate_dataset(
-                            batch_size=int(row["batch"]),
-                            dtype=row["dtype"],
-                            kv_cache=True,
-                            kv_cache_size_dist=row["kv_dist"],
-                            q_length=int(row["q_len"]),
-                            head_size=int(row["head_dim"]),
-                            num_heads=int(row["num_heads"]),
-                            num_kv_heads=int(row["num_kv_heads"]),
-                            attn_type=row["attn_type"],
-                            q_phase="causal" if int(row["q_len"]) > 2 else "prefill",
-                            num_batches=1,
-                            seed=seed,
-                            device=device,
-                            deterministic=deterministic,
-                        )
-                        save_dataset(data, row["path"])
-                        del data
-                        row["status"] = STATUS_GENERATED
-
-                        if uploader is not None:
-                            file_id = uploader.upload_file(path, remote_name=path.name)
-                            row["drive_file_id"] = file_id
-                            row["status"] = STATUS_UPLOADED
-                            if delete_after_upload:
-                                try:
-                                    path.unlink()
-                                except FileNotFoundError:
-                                    pass
-                    except torch.OutOfMemoryError:
-                        # Keep as OOM; rewrite oom_jobs.csv after retry pass.
-                        row["status"] = STATUS_OOM
-                        oom_row = {k: row.get(k, "") for k in row.keys() if k != "kv_dist"}
-                        oom_row["error"] = "OOM"
-                        still_oom.append(oom_row)
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    finally:
-                        _write_index(rows, index_path)
-
-                # Replace oom_rows file with only the ones that still failed after retry.
-                if still_oom:
-                    _write_oom(still_oom, oom_path)
-                    print(f"OOM retry finished. Still OOM: {len(still_oom)} (logged to {OOM_FILENAME}).")
-                else:
-                    # If everything succeeded, keep an empty file (or leave existing) by writing header-less nothing.
-                    # We only write the file when there are OOM rows to record.
-                    print("OOM retry finished. All previously OOM jobs succeeded.")
 
         if uploader is not None:
             _upload_csv_to_drive_replace(uploader, index_path)
             if oom_path.exists():
                 _upload_csv_to_drive_replace(uploader, oom_path)
+
         print(f"Done. Index written to {index_path}. Completed {done}/{total} jobs.")
     except KeyboardInterrupt:
         print("\nCtrl+C received. Saving index and exiting.")
@@ -427,13 +577,12 @@ def run(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(
-        description="Generate GQA dataset subset (batch 1,8,16,32,64,128; bf16; kv 1,500,1000,2000; Q 1,5; head 128; (32q/8kv) and (64q/8kv))."
-    )
-    ap.add_argument("--output-dir", "-o", type=Path, default=Path("datasets1"), help="Output directory")
+    ap = argparse.ArgumentParser(description="Generate MHA subset (q=5 only) with Drive + resume.")
+    ap.add_argument("--output-dir", "-o", type=Path, default=Path("datasets2"), help="Output directory")
     ap.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    ap.add_argument("--device", default=None, help="cuda, cuda:0, cpu")
+    ap.add_argument("--device", default=None, help="CUDA device for attention, e.g. cuda:0 (generation runs on CPU)")
     ap.add_argument("--deterministic", action="store_true")
+
     ap.add_argument("--drive-folder-id", default=None, help="If set, upload each generated .safetensors to this Drive folder")
     ap.add_argument("--auth", choices=["oauth", "service-account"], default="oauth")
     ap.add_argument("--credentials-json", default=None, help="OAuth client secret or service account JSON")
@@ -443,30 +592,12 @@ def main() -> None:
         action="store_true",
         help="If set with --drive-folder-id, keep local .safetensors after upload (default deletes).",
     )
-    ap.add_argument("--min-cpu-free-gb", type=float, default=1.0, help="Minimum free CPU RAM (GiB) before generating each job")
-    ap.add_argument("--min-gpu-free-gb", type=float, default=1.0, help="Minimum free GPU VRAM (GiB) before generating each job")
-    ap.add_argument("--no-retry-oom", action="store_true", help="Disable the one-time retry of OOM jobs at the end")
-    ap.add_argument("--force", action="store_true", help="Regenerate and re-upload all jobs (overrides resume/skips)")
-    ap.add_argument(
-        "--regenerate-q-lengths",
-        default="all",
-        help='Comma list of q lengths to regenerate (e.g. "5" or "1,5"). Default "all".',
-    )
-    ap.add_argument(
-        "--q5-only",
-        action="store_true",
-        help="Only generate jobs with q_length=5 (skips q_length=1).",
-    )
+
+    ap.add_argument("--min-cpu-free-gb", type=float, default=1.0, help="Minimum free CPU RAM (GiB) before each job")
+    ap.add_argument("--min-gpu-free-gb", type=float, default=1.0, help="Minimum free GPU VRAM (GiB) before each job")
+    ap.add_argument("--chunk-kv", type=int, default=128, help="KV chunk size for streaming attention softmax")
+
     args = ap.parse_args()
-
-    q_lengths: list[int] | None
-    if args.regenerate_q_lengths.lower() == "all":
-        q_lengths = None
-    else:
-        q_lengths = [int(x.strip()) for x in args.regenerate_q_lengths.split(",") if x.strip()]
-
-    q_lengths_filter: list[int] | None = [5] if args.q5_only else None
-
     run(
         args.output_dir,
         seed=args.seed,
@@ -479,12 +610,10 @@ def main() -> None:
         delete_after_upload=not args.keep_local,
         min_cpu_free_gb=args.min_cpu_free_gb,
         min_gpu_free_gb=args.min_gpu_free_gb,
-        retry_oom_once=not args.no_retry_oom,
-        force=args.force,
-        regenerate_q_lengths=q_lengths,
-        q_lengths_filter=q_lengths_filter,
+        chunk_kv=args.chunk_kv,
     )
 
 
 if __name__ == "__main__":
     main()
+
